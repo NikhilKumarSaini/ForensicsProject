@@ -1,50 +1,123 @@
 # ela_score.py
 import os
+from typing import Tuple
+
 from PIL import Image
 import numpy as np
+
+
+def _page_patch_features(
+    arr: np.ndarray,
+    grid: int = 32,
+    background_threshold: float = 1.0,
+) -> Tuple[float, float]:
+    """
+    Compute patch-based features for a single ELA page.
+
+    Returns
+    -------
+    max_z : float
+        Maximum robust z-score of patch means (only positive outliers).
+    max_mean_norm : float
+        Maximum patch mean intensity, normalized to [0, 1].
+    """
+    h, w = arr.shape
+    if h == 0 or w == 0:
+        return 0.0, 0.0
+
+    # Focus on central content region; crop margins (bank logo, viewer chrome)
+    top_margin = int(0.10 * h)
+    bottom_margin = int(0.05 * h)
+    left_margin = int(0.08 * w)
+    right_margin = int(0.08 * w)
+
+    y0 = top_margin
+    y1 = max(y0 + 1, h - bottom_margin)
+    x0 = left_margin
+    x1 = max(x0 + 1, w - right_margin)
+
+    arr = arr[y0:y1, x0:x1]
+    h, w = arr.shape
+    if h == 0 or w == 0:
+        return 0.0, 0.0
+
+    # Patch size; ensure at least 1 pixel per patch
+    ph = max(h // grid, 1)
+    pw = max(w // grid, 1)
+
+    patch_means = []
+
+    for y_start in range(0, h, ph):
+        y_end = min(h, y_start + ph)
+        for x_start in range(0, w, pw):
+            x_end = min(w, x_start + pw)
+
+            patch = arr[y_start:y_end, x_start:x_end]
+
+            # Ignore patches that are essentially background
+            active = patch[patch > background_threshold]
+            if active.size == 0:
+                continue
+
+            patch_means.append(float(active.mean()))
+
+    if not patch_means:
+        return 0.0, 0.0
+
+    means = np.array(patch_means, dtype=np.float32)
+
+    # Normalize to [0, 1]
+    means_norm = means / 255.0
+    max_mean_norm = float(np.max(means_norm))
+
+    # Robust z-scores for outlier strength
+    median = float(np.median(means_norm))
+    mad = float(np.median(np.abs(means_norm - median)))
+
+    if mad < 1e-6:
+        return 0.0, max_mean_norm
+
+    z_scores = (means_norm - median) / (mad + 1e-6)
+    max_z = float(np.max(z_scores))
+
+    if max_z < 0.0:
+        max_z = 0.0
+
+    return max_z, max_mean_norm
 
 
 def compute_ela_score(forensic_output_dir: str) -> float:
     """
     Compute ELA-based manipulation score in [0, 1].
 
-    Design goals
-    ------------
-    - Clean digital / programmatic statements:
-        score ≈ 0 or very small (0.0xx).
+    Goal
+    ----
+    - Clean digital / programmatic bank statements:
+        Score ≈ 0 or very small (0.0xx).
     - Manipulated statements:
-        higher scores, to combine later with other signals.
+        Higher scores, to combine with compression / noise / metadata scores.
 
-    Method (per document)
-    ---------------------
-    1. For each ELA JPEG in forensic_output_dir/ELA:
+    For each ELA JPEG in <forensic_output_dir>/ELA:
         - Convert to grayscale.
-        - Drop near-zero pixels (scanner / compression floor).
-        - Compute median, 90th percentile, 99th percentile of intensities
-          in [0, 1] space.
-    2. Aggregate across pages:
-        - med_doc  = median of page medians.
-        - p90_doc  = median of page 90th percentiles.
-        - p99_doc  = max of page 99th percentiles (worst page).
-    3. Shape features:
-        - spread     = p90_doc - med_doc  (how wide is the bulk).
-        - tail       = p99_doc - p90_doc  (how heavy is the extreme tail).
-        - tail_ratio = tail / spread.
-    4. Scoring:
-        - If tail_ratio is small or p99_doc is low, treat as clean → 0.
-        - Otherwise map tail_ratio to [0, 1] with a non-linear scaled
-          square so only strong anomalies get large scores.
+        - Compute:
+            * max_z: strongest positive robust z-score of patch means.
+            * max_mean_norm: brightest patch mean (0–1).
+    For the document:
+        - doc_z         = max(max_z over pages)
+        - doc_mean      = max(max_mean_norm over pages)
+        - doc_med_mean  = median(max_mean_norm over pages)
+        - bright_spike  = max(doc_mean - doc_med_mean, 0)
+    Scoring:
+        - If outlier strength and brightness are small → 0.0 (clean).
+        - Else map outlier strength and brightness spike into [0, 1].
     """
-
     ela_dir = os.path.join(forensic_output_dir, "ELA")
     if not os.path.exists(ela_dir):
         return 0.0
 
-    page_medians = []
-    page_p90s = []
-    page_p99s = []
+    page_zs = []
+    page_means = []
 
-    # ---------------- PER PAGE STATS ----------------
     for img_name in os.listdir(ela_dir):
         if not img_name.lower().endswith(".jpg"):
             continue
@@ -57,59 +130,46 @@ def compute_ela_score(forensic_output_dir: str) -> float:
         except Exception:
             continue
 
-        # Flatten and drop near-zero residuals (background floor)
-        flat = arr.reshape(-1)
-        flat = flat[flat > 1.0]
-        if flat.size == 0:
-            continue
+        max_z, max_mean_norm = _page_patch_features(arr)
+        page_zs.append(max_z)
+        page_means.append(max_mean_norm)
 
-        # Normalize to [0, 1]
-        flat_norm = flat / 255.0
-
-        page_medians.append(float(np.median(flat_norm)))
-        page_p90s.append(float(np.percentile(flat_norm, 90)))
-        page_p99s.append(float(np.percentile(flat_norm, 99)))
-
-    if not page_medians:
+    if not page_zs:
         return 0.0
 
-    # ---------------- DOCUMENT-LEVEL STATS ----------------
-    med_doc = float(np.median(page_medians))
-    p90_doc = float(np.median(page_p90s))
-    p99_doc = float(np.max(page_p99s))  # strongest page
+    doc_z = float(max(page_zs))
+    doc_mean = float(max(page_means))
+    doc_med_mean = float(np.median(page_means))
+    bright_spike = max(0.0, doc_mean - doc_med_mean)
 
-    # Spread of the main mass vs extreme tail
-    spread = max(1e-6, p90_doc - med_doc)
-    tail = max(0.0, p99_doc - p90_doc)
-    tail_ratio = tail / spread
+    # ------------ EARLY CLEAN CHECK ------------
+    # These thresholds are intentionally conservative so
+    # programmatic statements with only regular text and
+    # watermark behaviour collapse to 0.
+    Z_MIN_SUSPICIOUS = 4.0       # robust z above this suggests a local anomaly
+    MEAN_MIN_SUSPICIOUS = 0.30   # need non-trivial ELA brightness in some patch
 
-    # ---------------- EARLY CLEAN CHECK ----------------
-    # Conservative conditions so clean, programmatic PDFs go to ~0:
-    #  - p99_doc very low   → overall ELA energy small.
-    #  - tail_ratio small   → no heavy tail beyond typical ELA.
-    #
-    # You can tighten or relax these two constants if you inspect
-    # a small calibration set, but these are a safe starting point.
-    TAIL_CLEAN_MAX = 0.5   # tail not much larger than main spread
-    P99_CLEAN_MAX = 0.20   # very weak extremes overall
-
-    if p99_doc < P99_CLEAN_MAX or tail_ratio <= TAIL_CLEAN_MAX:
+    if doc_z < Z_MIN_SUSPICIOUS or doc_mean < MEAN_MIN_SUSPICIOUS:
         return 0.0
 
-    # ---------------- SCORE MAPPING ----------------
-    # For suspicious docs, use only the tail_ratio as a shape-based
-    # anomaly proxy. We map:
-    #   tail_ratio in [TAIL_CLEAN_MAX, TAIL_SUSPICIOUS_MAX] → [0, 1]
-    # then square it so values just above the threshold stay very low
-    # and only strong tails climb toward 1.
-    TAIL_SUSPICIOUS_MAX = 3.0
+    # ------------ SCORE MAPPING ------------
+    # 1) Outlier strength based on doc_z
+    Z_MAX_STRONG = 12.0
+    nz = (doc_z - Z_MIN_SUSPICIOUS) / (Z_MAX_STRONG - Z_MIN_SUSPICIOUS)
+    nz = float(np.clip(nz, 0.0, 1.0))
 
-    # Normalized tail strength
-    raw = (tail_ratio - TAIL_CLEAN_MAX) / (TAIL_SUSPICIOUS_MAX - TAIL_CLEAN_MAX)
-    raw = float(np.clip(raw, 0.0, 1.0))
+    # 2) Brightness spike: how much brighter the worst patch is
+    #    compared to a typical bright patch.
+    #    0.00–0.05 is mild, ~0.25–0.30 is strong.
+    B_MAX_STRONG = 0.30
+    nb = bright_spike / B_MAX_STRONG
+    nb = float(np.clip(nb, 0.0, 1.0))
 
-    # Non-linear scaling: emphasize strong anomalies
-    score = raw * raw
+    # Combine. Outlier strength dominates; brightness spike helps.
+    raw_score = 0.7 * nz + 0.3 * nb
+
+    # Non-linear scaling to keep mild anomalies low.
+    score = raw_score * raw_score
 
     score = float(np.clip(score, 0.0, 1.0))
     return float(round(score, 3))
