@@ -10,20 +10,20 @@ def perform_ela(image_path: str, save_path: str, quality: int = 90) -> None:
     Parameters
     ----------
     image_path : str
-        Path to the original input image (page raster from PDF).
+        Path to the original input image.
     save_path : str
         Path where the ELA JPEG image should be written.
     quality : int, optional
-        JPEG quality for recompression. Must be constant across the dataset.
+        JPEG quality for recompression. Must stay constant across the dataset.
     """
-    # Load original in a consistent RGB space
+    # Load original image in RGB
     original = Image.open(image_path).convert("RGB")
 
     # Temporary recompressed copy
     temp_path = save_path + ".tmp.jpg"
     original.save(temp_path, "JPEG", quality=quality)
 
-    # Reload recompressed version
+    # Reload recompressed copy
     recompressed = Image.open(temp_path).convert("RGB")
 
     # Absolute difference between original and recompressed
@@ -33,7 +33,7 @@ def perform_ela(image_path: str, save_path: str, quality: int = 90) -> None:
     enhancer = ImageEnhance.Brightness(diff)
     ela_image = enhancer.enhance(10.0)
 
-    # Save final ELA image
+    # Save ELA image
     ela_image.save(save_path, "JPEG")
 
     # Cleanup
