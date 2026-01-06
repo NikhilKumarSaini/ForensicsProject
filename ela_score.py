@@ -5,18 +5,18 @@ import numpy as np
 
 def compute_ela_score(forensic_output_dir: str) -> float:
     """
-    Robust ELA score (0–1)
+    Scientifically correct ELA score (0–1)
 
-    - Clean PDFs → ~0.0
-    - Word / programmatic PDFs → very low (0–0.05)
-    - Manipulated → spikes preserved
+    - Median std → clean / benign
+    - High-percentile std → manipulation
     """
 
     ela_dir = os.path.join(forensic_output_dir, "ELA")
     if not os.path.exists(ela_dir):
         return 0.0
 
-    scores = []
+    medians = []
+    p90s = []
 
     for img in os.listdir(ela_dir):
         if not img.lower().endswith(".jpg"):
@@ -26,28 +26,36 @@ def compute_ela_score(forensic_output_dir: str) -> float:
             image = Image.open(os.path.join(ela_dir, img)).convert("RGB")
             arr = np.array(image, dtype=np.float32)
 
-            # Compute per-channel std
             std_map = arr.std(axis=2)
 
-            # Remove background noise (very low variance)
-            std_map = std_map[std_map > 2.0]
+            # Ignore background noise
+            std_map = std_map[std_map > 1.5]
 
             if std_map.size > 0:
-                # Use MEDIAN (robust to benign spikes)
-                scores.append(np.median(std_map))
+                medians.append(np.median(std_map))
+                p90s.append(np.percentile(std_map, 90))
 
         except Exception:
             continue
 
-    if not scores:
+    if not medians:
         return 0.0
 
-    raw = float(np.median(scores)) / 255.0
+    median_raw = np.median(medians) / 255.0
+    p90_raw = np.median(p90s) / 255.0
 
-    # -----------------------------
-    # CLEAN NOISE FLOOR (CRITICAL)
-    # -----------------------------
-    if raw < 0.06:
+    # ---------------- CLEAN DOCUMENT ----------------
+    if median_raw < 0.03 and p90_raw < 0.08:
         return 0.0
 
-    return round(raw, 3)
+    # ---------------- LOW / BENIGN ----------------
+    if p90_raw < 0.12:
+        return round(min(0.15, p90_raw), 3)
+
+    # ---------------- MODERATE ----------------
+    if p90_raw < 0.22:
+        score = 0.15 + (p90_raw - 0.12) / 0.10 * 0.20
+        return round(score, 3)
+
+    # ---------------- HIGH ----------------
+    return round(min(1.0, 0.35 + p90_raw), 3)
