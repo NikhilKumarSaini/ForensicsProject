@@ -3,10 +3,10 @@ import numpy as np
 from PIL import Image
 
 
-def _patch_means(gray: np.ndarray, grid: int = 48) -> np.ndarray:
+def _patch_values(gray: np.ndarray, grid: int = 60) -> np.ndarray:
     h, w = gray.shape
-    ph = max(h // grid, 8)
-    pw = max(w // grid, 8)
+    ph = max(h // grid, 10)
+    pw = max(w // grid, 10)
 
     vals = []
     for y in range(0, h, ph):
@@ -15,66 +15,73 @@ def _patch_means(gray: np.ndarray, grid: int = 48) -> np.ndarray:
             if patch.size == 0:
                 continue
 
-            active = patch[patch > 2.0]
-            if active.size < 0.15 * patch.size:
+            active = patch > 2.0
+            if active.mean() < 0.12:
                 continue
 
-            vals.append(float(active.mean()) / 255.0)
+            vals.append(float(patch[active].mean()) / 255.0)
 
     return np.array(vals, dtype=np.float32)
 
 
 def compute_compression_score(forensic_output_dir: str) -> float:
     """
-    Compression manipulation score (0..1) from Compression diff images.
+    Compression score (0..1) from Compression diff images.
 
-    Uses patch-based tail/outlier ratios.
-    This avoids the old saturation problem from pixel-threshold area scoring.
+    Fixes:
+    - Low-content guard like ELA
+    - More aggressive mapping so manipulated rises above 0.1–0.2 range
     """
-
     comp_dir = os.path.join(forensic_output_dir, "Compression")
     if not os.path.exists(comp_dir):
         return 0.0
 
-    metrics = []
+    page_scores = []
 
     for name in os.listdir(comp_dir):
         if not name.lower().endswith(".jpg"):
             continue
 
         path = os.path.join(comp_dir, name)
-
         try:
             with Image.open(path).convert("L") as im:
                 gray = np.array(im, dtype=np.float32)
         except Exception:
             continue
 
-        vals = _patch_means(gray, grid=48)
-        if vals.size < 30:
+        active_fraction = float((gray > 2.0).mean())
+        if active_fraction < 0.015:
+            page_scores.append(0.0)
             continue
 
-        p50 = float(np.percentile(vals, 50))
-        p90 = float(np.percentile(vals, 90))
-        p99 = float(np.percentile(vals, 99))
-        eps = 1e-6
+        vals = _patch_values(gray, grid=60)
+        if vals.size < 120:
+            page_scores.append(0.0)
+            continue
 
-        tail_ratio = (p99 + eps) / (p50 + eps)
-        spike_ratio = (p99 - p90) / (p90 + eps)
+        med = float(np.median(vals))
+        mad = float(np.median(np.abs(vals - med))) + 1e-6
+        thresh = med + 3.0 * mad
 
-        metrics.append(0.7 * (tail_ratio - 1.0) + 0.3 * spike_ratio)
+        ratio = float(np.count_nonzero(vals > thresh)) / float(vals.size)
 
-    if not metrics:
+        if med < 0.03 and ratio < 0.06:
+            page_scores.append(0.0)
+            continue
+
+        # Mapping
+        if ratio < 0.01:
+            score = 0.0
+        elif ratio < 0.03:
+            score = 0.10 + (ratio - 0.01) / 0.02 * 0.30  # 0.10 -> 0.40
+        elif ratio < 0.08:
+            score = 0.40 + (ratio - 0.03) / 0.05 * 0.40  # 0.40 -> 0.80
+        else:
+            score = 0.80 + min(0.20, (ratio - 0.08) / 0.10 * 0.20)
+
+        page_scores.append(float(score))
+
+    if not page_scores:
         return 0.0
 
-    m = float(max(metrics))
-
-    # Mapping to 0..1
-    if m < 0.60:
-        return 0.0
-    if m < 1.00:
-        return float(round(0.05 + (m - 0.60) / 0.40 * 0.20, 3))
-    if m < 1.60:
-        return float(round(0.25 + (m - 1.00) / 0.60 * 0.35, 3))
-
-    return float(round(min(1.0, 0.60 + (m - 1.60) / 1.00 * 0.40), 3))
+    return float(round(min(1.0, max(page_scores)), 3))
