@@ -5,25 +5,21 @@ import numpy as np
 
 def compute_compression_score(forensic_output_dir: str) -> float:
     """
-    Compression score in [0, 1], based on the energy and variability
-    of the compression-difference images.
+    Compression score in [0, 1] based on the AREA of strong
+    compression differences in the diff images.
 
-    Expected behaviour
-    ------------------
-    - Very simple, clean digital statements (like the Lokesh Notepad PDF)
-      → near 0 (often exactly 0).
-    - Normal, clean but busy bank statements
-      → low to moderate scores.
-    - Manipulated / unusual statements with stronger or uneven artefacts
-      → higher scores.
+    Behaviour:
+    - Very simple, clean digital pages (like the Lokesh Notepad statement)
+      → small high-diff area → score near 0.
+    - Busier / manipulated statements with more strong differences
+      → larger high-diff area → higher score.
     """
 
     comp_dir = os.path.join(forensic_output_dir, "Compression")
     if not os.path.exists(comp_dir):
         return 0.0
 
-    page_means = []
-    page_stds = []
+    high_area_ratios = []
 
     for img_name in os.listdir(comp_dir):
         if not img_name.lower().endswith(".jpg"):
@@ -32,61 +28,48 @@ def compute_compression_score(forensic_output_dir: str) -> float:
         img_path = os.path.join(comp_dir, img_name)
 
         try:
-            # Work in grayscale on the compression-diff image
             with Image.open(img_path).convert("L") as image:
                 arr = np.array(image, dtype=np.float32)
         except Exception:
             continue
 
-        flat = arr.reshape(-1)
+        # Flatten and normalize to [0, 1]
+        flat = arr.reshape(-1) / 255.0
 
-        # Remove near-zero background
-        flat = flat[flat > 1.0]
+        # Drop pure background / tiny noise
+        flat = flat[flat > 0.02]
         if flat.size == 0:
             continue
 
-        # Normalize to [0, 1]
-        flat_norm = flat / 255.0
+        # Fraction of pixels with "strong" compression difference
+        # THRESH_STRONG can be tuned; start with 0.25
+        THRESH_STRONG = 0.25
+        strong = flat > THRESH_STRONG
+        ratio_strong = float(np.count_nonzero(strong)) / float(flat.size)
 
-        page_means.append(float(flat_norm.mean()))
-        page_stds.append(float(flat_norm.std()))
+        high_area_ratios.append(ratio_strong)
 
-    if not page_means:
+    if not high_area_ratios:
         return 0.0
 
-    # Document-level stats (across pages)
-    mean_doc = float(np.median(page_means))   # overall artefact energy
-    std_doc = float(np.median(page_stds))     # overall variability
-
-    # ---------------- EARLY CLEAN SHORTCUT ----------------
-    # Very low energy means the page barely changes between
-    # quality 70 and 95 → gentle compression, clean digital.
-    ENERGY_CLEAN_MAX = 0.015  # tweak up or down if needed
-
-    if mean_doc <= ENERGY_CLEAN_MAX:
-        return 0.0
+    # Document-level: typical strong-area fraction across pages
+    doc_ratio = float(np.median(high_area_ratios))
 
     # ---------------- SCORE MAPPING ----------------
-    # 1) Core score from energy:
-    #    mean_doc in [ENERGY_CLEAN_MAX, ENERGY_HIGH] → [0, 1]
-    ENERGY_HIGH = 0.10  # where we consider compression artefacts strong
+    # For very simple pages, doc_ratio will be very small.
+    # We treat anything up to RATIO_CLEAN_MAX as effectively 0.
+    RATIO_CLEAN_MAX = 0.03   # ~3% of content pixels strong
+    RATIO_HIGH = 0.25        # ~25% strong area is considered very high
 
-    energy_norm = (mean_doc - ENERGY_CLEAN_MAX) / (ENERGY_HIGH - ENERGY_CLEAN_MAX)
-    energy_norm = float(np.clip(energy_norm, 0.0, 1.0))
+    if doc_ratio <= RATIO_CLEAN_MAX:
+        return 0.0
 
-    # 2) Extra score from variability:
-    #    std_doc in [STD_LOW, STD_HIGH] → [0, 1]
-    STD_LOW = 0.005
-    STD_HIGH = 0.06
+    # Normalize between clean and high
+    norm = (doc_ratio - RATIO_CLEAN_MAX) / (RATIO_HIGH - RATIO_CLEAN_MAX)
+    norm = float(np.clip(norm, 0.0, 1.0))
 
-    std_norm = (std_doc - STD_LOW) / (STD_HIGH - STD_LOW)
-    std_norm = float(np.clip(std_norm, 0.0, 1.0))
-
-    # Combine: energy dominates, variability supports
-    raw_score = 0.7 * energy_norm + 0.3 * std_norm
-
-    # Gentle non-linearity so small deviations stay low
-    score = raw_score * raw_score
+    # Mild non-linearity: keep small deviations low, strong ones high
+    score = norm ** 0.7  # 0.7 < 1 makes it a bit more sensitive
 
     score = float(np.clip(score, 0.0, 1.0))
     return float(round(score, 3))
