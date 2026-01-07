@@ -5,21 +5,27 @@ import numpy as np
 
 def compute_compression_score(forensic_output_dir: str) -> float:
     """
-    Compression score in [0, 1] based on the AREA of strong
-    compression differences in the diff images.
+    Compression score in [0, 1] based on global energy and variability of the
+    compression-difference images.
 
     Behaviour:
-    - Very simple, clean digital pages (like the Lokesh Notepad statement)
-      → small high-diff area → score near 0.
-    - Busier / manipulated statements with more strong differences
-      → larger high-diff area → higher score.
+    - Very simple, clean digital pages (e.g. Notepad Lokesh statement)
+      → very low mean diff → score near 0.
+    - Normal clean statements with more text/table/logo
+      → low to moderate scores.
+    - Manipulated / unusual statements (heavier or uneven artefacts)
+      → higher scores.
+
+    This mapping is deliberately gentle so it does not saturate at 1 for
+    every bank statement.
     """
 
     comp_dir = os.path.join(forensic_output_dir, "Compression")
     if not os.path.exists(comp_dir):
         return 0.0
 
-    high_area_ratios = []
+    page_means = []
+    page_stds = []
 
     for img_name in os.listdir(comp_dir):
         if not img_name.lower().endswith(".jpg"):
@@ -33,43 +39,48 @@ def compute_compression_score(forensic_output_dir: str) -> float:
         except Exception:
             continue
 
-        # Flatten and normalize to [0, 1]
-        flat = arr.reshape(-1) / 255.0
+        flat = arr.reshape(-1)
 
-        # Drop pure background / tiny noise
-        flat = flat[flat > 0.02]
+        # Remove near-zero background
+        flat = flat[flat > 1.0]
         if flat.size == 0:
             continue
 
-        # Fraction of pixels with "strong" compression difference
-        # THRESH_STRONG can be tuned; start with 0.25
-        THRESH_STRONG = 0.25
-        strong = flat > THRESH_STRONG
-        ratio_strong = float(np.count_nonzero(strong)) / float(flat.size)
+        flat_norm = flat / 255.0
 
-        high_area_ratios.append(ratio_strong)
+        page_means.append(float(flat_norm.mean()))
+        page_stds.append(float(flat_norm.std()))
 
-    if not high_area_ratios:
+    if not page_means:
         return 0.0
 
-    # Document-level: typical strong-area fraction across pages
-    doc_ratio = float(np.median(high_area_ratios))
+    # Document-level stats
+    mean_doc = float(np.median(page_means))   # overall artefact energy
+    std_doc = float(np.median(page_stds))     # overall variability
+
+    # ---------------- EARLY CLEAN SHORTCUT ----------------
+    # Very low energy: essentially no compression difference.
+    ENERGY_CLEAN_MAX = 0.015  # adjust slightly if Lokesh still > 0
+
+    if mean_doc <= ENERGY_CLEAN_MAX:
+        return 0.0
 
     # ---------------- SCORE MAPPING ----------------
-    # For very simple pages, doc_ratio will be very small.
-    # We treat anything up to RATIO_CLEAN_MAX as effectively 0.
-    RATIO_CLEAN_MAX = 0.03   # ~3% of content pixels strong
-    RATIO_HIGH = 0.25        # ~25% strong area is considered very high
+    # 1) Energy-based component
+    ENERGY_HIGH = 0.20  # strong diff; chosen high so we do not saturate
+    energy_norm = mean_doc / ENERGY_HIGH
+    energy_norm = float(np.clip(energy_norm, 0.0, 1.0))
 
-    if doc_ratio <= RATIO_CLEAN_MAX:
-        return 0.0
+    # 2) Variability component (how uneven the artefacts are)
+    STD_HIGH = 0.10
+    std_norm = std_doc / STD_HIGH
+    std_norm = float(np.clip(std_norm, 0.0, 1.0))
 
-    # Normalize between clean and high
-    norm = (doc_ratio - RATIO_CLEAN_MAX) / (RATIO_HIGH - RATIO_CLEAN_MAX)
-    norm = float(np.clip(norm, 0.0, 1.0))
+    # Combine: energy dominates, variability supports
+    raw_score = 0.7 * energy_norm + 0.3 * std_norm
 
-    # Mild non-linearity: keep small deviations low, strong ones high
-    score = norm ** 0.7  # 0.7 < 1 makes it a bit more sensitive
+    # Gentle non-linearity so small deviations stay low
+    score = raw_score ** 0.8
 
     score = float(np.clip(score, 0.0, 1.0))
     return float(round(score, 3))
