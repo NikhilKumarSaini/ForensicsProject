@@ -1,87 +1,34 @@
 import os
-from PIL import Image
 import numpy as np
+from PIL import Image, ImageChops
 
 
-def compute_ela_score(forensic_output_dir: str) -> float:
+def perform_ela(image_path: str, save_path: str, quality: int = 90) -> None:
     """
-    Conservative ELA score in [0, 1].
+    Non-saturating ELA generator.
 
-    Design
-    ------
-    - For fully digital, system-generated PDFs (like your examples),
-      ELA residuals after a single JPEG recompression are low and fairly
-      uniform. Score should be 0 or very small.
-    - For scanned / heavily recompressed / image-heavy PDFs,
-      residual energy is higher and more variable → higher score.
-
-    For each ELA jpg:
-        - Convert to grayscale.
-        - Remove near-zero background.
-        - Compute mean and std of residual intensity in [0, 1].
-
-    Document-level:
-        - energy_doc = median(mean_page)
-        - var_doc    = median(std_page)
+    Fix:
+    - Removes Brightness.enhance(10) which clips and makes all pages look high.
+    - Normalizes diff to 0..255 based on page max diff (preserves structure).
     """
 
-    ela_dir = os.path.join(forensic_output_dir, "ELA")
-    if not os.path.exists(ela_dir):
-        return 0.0
+    original = Image.open(image_path).convert("RGB")
 
-    page_means = []
-    page_stds = []
+    temp_path = save_path + ".tmp.jpg"
+    original.save(temp_path, "JPEG", quality=quality)
 
-    for img_name in os.listdir(ela_dir):
-        if not img_name.lower().endswith(".jpg"):
-            continue
+    recompressed = Image.open(temp_path).convert("RGB")
+    diff = ImageChops.difference(original, recompressed)
 
-        img_path = os.path.join(ela_dir, img_name)
+    arr = np.array(diff, dtype=np.float32)
+    maxv = float(arr.max())
+    if maxv < 1.0:
+        maxv = 1.0
 
-        try:
-            with Image.open(img_path).convert("L") as image:
-                arr = np.array(image, dtype=np.float32)
-        except Exception:
-            continue
+    arr = np.clip(arr * (255.0 / maxv), 0, 255).astype(np.uint8)
+    ela_image = Image.fromarray(arr, mode="RGB")
+    ela_image.save(save_path, "JPEG")
 
-        flat = arr.reshape(-1)
-        flat = flat[flat > 1.0]  # drop pure background
-        if flat.size == 0:
-            continue
-
-        flat_norm = flat / 255.0
-
-        page_means.append(float(flat_norm.mean()))
-        page_stds.append(float(flat_norm.std()))
-
-    if not page_means:
-        return 0.0
-
-    energy_doc = float(np.median(page_means))
-    var_doc = float(np.median(page_stds))
-
-    # ---------------- EARLY CLEAN SHORTCUT ----------------
-    # Very low ELA energy: clean digital, system-generated statements.
-    ENERGY_CLEAN_MAX = 0.015
-
-    if energy_doc <= ENERGY_CLEAN_MAX:
-        return 0.0
-
-    # ---------------- SCORE MAPPING ----------------
-    ENERGY_HIGH = 0.15
-    VAR_HIGH = 0.08
-
-    energy_norm = energy_doc / ENERGY_HIGH
-    energy_norm = float(np.clip(energy_norm, 0.0, 1.0))
-
-    var_norm = var_doc / VAR_HIGH
-    var_norm = float(np.clip(var_norm, 0.0, 1.0))
-
-    # ELA is a weaker signal, so we compress it
-    raw_score = 0.6 * energy_norm + 0.4 * var_norm
-
-    # Stronger compression to keep digital docs low
-    score = raw_score ** 1.5
-
-    score = float(np.clip(score, 0.0, 1.0))
-    return float(round(score, 3))
+    original.close()
+    recompressed.close()
+    os.remove(temp_path)
