@@ -7,13 +7,10 @@ project_root = os.path.dirname(script_dir)
 pdf_folder = os.path.join(project_root, "uploads")
 images_folder = os.path.join(project_root, "Images")
 
-print("PDF folder:", pdf_folder)
-print("Images folder:", images_folder)
+os.makedirs(images_folder, exist_ok=True)
 
 if not os.path.exists(pdf_folder):
     print("error pdf folder not exists")
-
-os.makedirs(images_folder, exist_ok=True)
 
 for pdf_file in os.listdir(pdf_folder):
     if not pdf_file.lower().endswith(".pdf"):
@@ -31,17 +28,20 @@ for pdf_file in os.listdir(pdf_folder):
     try:
         doc = fitz.open(pdf_path)
 
-        # Render at 2x scale for stable text edges (roughly 144 DPI)
-        mat = fitz.Matrix(2, 2)
+        # Render at higher resolution for stability
+        zoom = 2.0
+        mat = fitz.Matrix(zoom, zoom)
 
         for page_number in range(doc.page_count):
             page = doc.load_page(page_number)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
 
-            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB, alpha=False)
-
-            image_name = f"page-{page_number + 1}.png"
+            # ALWAYS save JPG
+            image_name = f"page-{page_number + 1}.jpg"
             image_path = os.path.join(output_folder, image_name)
-            pix.save(image_path)
+
+            # Force JPEG output
+            pix.save(image_path, output="jpg")
 
         print(f"Converted {doc.page_count} Pages Successfully")
 
