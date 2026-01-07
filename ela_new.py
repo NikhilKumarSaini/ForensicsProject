@@ -1,53 +1,40 @@
 import os
-import tempfile
-from PIL import Image, ImageChops, ImageEnhance
+from PIL import Image
+import numpy as np
 
 
-def perform_ela(image_path: str, save_path: str, quality: int = 90) -> None:
+def perform_ela(image_path: str, save_path: str, quality: int = 85) -> None:
     """
-    ELA output image (diff) written to save_path.
+    Error Level Analysis (ELA) that produces a normalized residual map.
 
-    Key fixes:
-    - recompress at fixed quality
-    - compute diff
-    - scale adaptively based on max residual (no fixed enhance(10) saturation)
+    Key changes vs your old version:
+    - Use numpy to compute residuals.
+    - Normalize residual per page by its max, so "enhance(10)" saturation does not flatten all docs.
+    - Save as JPG only.
     """
     original = Image.open(image_path).convert("RGB")
 
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
-    os.close(tmp_fd)
+    # temp recompressed jpg
+    temp_path = save_path + ".tmp.jpg"
+    original.save(temp_path, "JPEG", quality=quality, optimize=True, subsampling=0)
 
-    try:
-        original.save(tmp_path, "JPEG", quality=quality, optimize=True)
+    recompressed = Image.open(temp_path).convert("RGB")
 
-        recompressed = Image.open(tmp_path).convert("RGB")
-        diff = ImageChops.difference(original, recompressed)
+    a = np.asarray(original, dtype=np.int16)
+    b = np.asarray(recompressed, dtype=np.int16)
 
-        # Adaptive scaling: stretch residuals so max becomes 255
-        extrema = diff.getextrema()  # [(min,max) per channel]
-        max_residual = max(ch[1] for ch in extrema) if extrema else 0
+    diff = np.abs(a - b).astype(np.float32)  # 0..255
+    diff_gray = diff.mean(axis=2)            # 0..255
 
-        if max_residual > 0:
-            scale = 255.0 / float(max_residual)
-        else:
-            scale = 1.0
+    mx = float(diff_gray.max())
+    if mx < 1e-6:
+        out = np.zeros_like(diff_gray, dtype=np.uint8)
+    else:
+        # normalize to full contrast
+        out = np.clip((diff_gray / mx) * 255.0, 0, 255).astype(np.uint8)
 
-        ela_image = ImageEnhance.Brightness(diff).enhance(scale)
+    Image.fromarray(out).save(save_path, "JPEG", quality=95, optimize=True, subsampling=0)
 
-        # Save ELA image
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        ela_image.save(save_path, "JPEG", quality=95, optimize=True)
-
-    finally:
-        try:
-            original.close()
-        except Exception:
-            pass
-        try:
-            recompressed.close()
-        except Exception:
-            pass
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+    original.close()
+    recompressed.close()
+    os.remove(temp_path)
