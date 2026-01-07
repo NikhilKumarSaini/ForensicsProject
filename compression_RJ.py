@@ -1,57 +1,40 @@
-from PIL import Image, ImageChops, ImageEnhance
+from PIL import Image
+import numpy as np
 import os
-import tempfile
 
 
 def compression_difference(image_path, save_path):
     """
-    Generates a compression inconsistency map by comparing low vs high JPEG quality.
+    Compression difference map.
 
-    Key fixes:
-    - adaptive scaling (no enhance(10) saturation)
-    - slightly stronger separation between low/high qualities
+    Key changes:
+    - Bigger quality gap (35 vs 95) so altered regions pop.
+    - Normalize per page (like ELA) so results are comparable across docs.
+    - Save JPG only.
     """
     img = Image.open(image_path).convert("RGB")
 
-    low_fd, low_path = tempfile.mkstemp(suffix="_low.jpg")
-    high_fd, high_path = tempfile.mkstemp(suffix="_high.jpg")
-    os.close(low_fd)
-    os.close(high_fd)
+    low = save_path.replace(".jpg", "_low.jpg")
+    high = save_path.replace(".jpg", "_high.jpg")
 
-    try:
-        # Wider gap helps detect local edits
-        img.save(low_path, "JPEG", quality=60, optimize=True)
-        img.save(high_path, "JPEG", quality=95, optimize=True)
+    # stronger separation
+    img.save(low, "JPEG", quality=35, optimize=True, subsampling=0)
+    img.save(high, "JPEG", quality=95, optimize=True, subsampling=0)
 
-        low_img = Image.open(low_path).convert("RGB")
-        high_img = Image.open(high_path).convert("RGB")
+    a = np.asarray(Image.open(low).convert("RGB"), dtype=np.int16)
+    b = np.asarray(Image.open(high).convert("RGB"), dtype=np.int16)
 
-        diff = ImageChops.difference(low_img, high_img)
+    diff = np.abs(a - b).astype(np.float32)
+    diff_gray = diff.mean(axis=2)
 
-        extrema = diff.getextrema()
-        max_residual = max(ch[1] for ch in extrema) if extrema else 0
-        scale = 255.0 / float(max_residual) if max_residual > 0 else 1.0
+    mx = float(diff_gray.max())
+    if mx < 1e-6:
+        out = np.zeros_like(diff_gray, dtype=np.uint8)
+    else:
+        out = np.clip((diff_gray / mx) * 255.0, 0, 255).astype(np.uint8)
 
-        comp_image = ImageEnhance.Brightness(diff).enhance(scale)
+    Image.fromarray(out).save(save_path, "JPEG", quality=95, optimize=True, subsampling=0)
 
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        comp_image.save(save_path, "JPEG", quality=95, optimize=True)
-
-    finally:
-        try:
-            img.close()
-        except Exception:
-            pass
-        try:
-            low_img.close()
-        except Exception:
-            pass
-        try:
-            high_img.close()
-        except Exception:
-            pass
-        for p in (low_path, high_path):
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+    img.close()
+    os.remove(low)
+    os.remove(high)
