@@ -7,10 +7,14 @@ project_root = os.path.dirname(script_dir)
 pdf_folder = os.path.join(project_root, "uploads")
 images_folder = os.path.join(project_root, "Images")
 
-os.makedirs(images_folder, exist_ok=True)
-
 if not os.path.exists(pdf_folder):
     print("error pdf folder not exists")
+
+os.makedirs(images_folder, exist_ok=True)
+
+# Higher render resolution helps forensic signals a lot
+ZOOM = 2.0  # 2.0 = 2x in each dimension (sharp text)
+JPG_QUALITY = 95
 
 for pdf_file in os.listdir(pdf_folder):
     if not pdf_file.lower().endswith(".pdf"):
@@ -27,21 +31,17 @@ for pdf_file in os.listdir(pdf_folder):
 
     try:
         doc = fitz.open(pdf_path)
-
-        # Render at higher resolution for stability
-        zoom = 2.0
-        mat = fitz.Matrix(zoom, zoom)
+        matrix = fitz.Matrix(ZOOM, ZOOM)
 
         for page_number in range(doc.page_count):
             page = doc.load_page(page_number)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
 
-            # ALWAYS save JPG
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
             image_name = f"page-{page_number + 1}.jpg"
             image_path = os.path.join(output_folder, image_name)
 
-            # Force JPEG output
-            pix.save(image_path, output="jpg")
+            # Save as high-quality JPEG
+            pix.save(image_path, jpg_quality=JPG_QUALITY)
 
         print(f"Converted {doc.page_count} Pages Successfully")
 
