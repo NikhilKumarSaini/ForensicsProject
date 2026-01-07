@@ -5,7 +5,7 @@ from PIL import Image
 
 def _patch_values(gray: np.ndarray, grid: int = 60) -> np.ndarray:
     """
-    Returns per-patch mean intensity (0..1) ignoring background.
+    Returns per-patch mean intensity (0..1), ignoring background-heavy patches.
     """
     h, w = gray.shape
     ph = max(h // grid, 10)
@@ -18,23 +18,25 @@ def _patch_values(gray: np.ndarray, grid: int = 60) -> np.ndarray:
             if patch.size == 0:
                 continue
 
-            # Ignore near-zero background
-            active = patch[patch > 2.0]
-            if active.size < 0.10 * patch.size:
+            active = patch > 2.0
+            # Ignore patches that are mostly background
+            if active.mean() < 0.12:
                 continue
 
-            vals.append(float(active.mean()) / 255.0)
+            vals.append(float(patch[active].mean()) / 255.0)
 
     return np.array(vals, dtype=np.float32)
 
 
 def compute_ela_score(forensic_output_dir: str) -> float:
     """
-    ELA score (0..1) using robust outlier-patch ratio.
+    ELA score (0..1)
 
-    - Compute patch mean intensities from the ELA image.
-    - Compute robust baseline: median + 3*MAD.
-    - Score is based on fraction of patches exceeding that baseline.
+    Key fixes:
+    - LOW CONTENT GUARD:
+      If the page has too little active area OR too few usable patches,
+      return 0 for that page (prevents Lokesh false positives).
+    - More aggressive mapping AFTER the guard so manipulated pages rise.
     """
     ela_dir = os.path.join(forensic_output_dir, "ELA")
     if not os.path.exists(ela_dir):
@@ -53,33 +55,44 @@ def compute_ela_score(forensic_output_dir: str) -> float:
         except Exception:
             continue
 
+        # ---------------- LOW CONTENT GUARD ----------------
+        active_fraction = float((gray > 2.0).mean())
+        # Very empty pages (Lokesh-style) should not produce ELA spikes
+        if active_fraction < 0.015:  # 1.5% of pixels active
+            page_scores.append(0.0)
+            continue
+
         vals = _patch_values(gray, grid=60)
-        if vals.size < 40:
+
+        # If too few patches survived, stats become unstable -> treat as clean
+        if vals.size < 120:
+            page_scores.append(0.0)
             continue
 
         med = float(np.median(vals))
-        mad = float(np.median(np.abs(vals - med))) + 1e-6  # robust spread
+        mad = float(np.median(np.abs(vals - med))) + 1e-6
         thresh = med + 3.0 * mad
 
-        outliers = vals > thresh
-        ratio = float(np.count_nonzero(outliers)) / float(vals.size)
+        ratio = float(np.count_nonzero(vals > thresh)) / float(vals.size)
 
-        # Map ratio to [0,1]
-        # Clean pages usually have tiny outlier ratios.
-        # Manipulated tends to create more localized spikes.
+        # Extra guard: for low-energy documents, small ratios are benign
+        if med < 0.03 and ratio < 0.06:
+            page_scores.append(0.0)
+            continue
+
+        # ---------------- SCORE MAPPING (MORE SENSITIVE) ----------------
         if ratio < 0.01:
             score = 0.0
-        elif ratio < 0.04:
-            score = 0.10 + (ratio - 0.01) / 0.03 * 0.25
-        elif ratio < 0.10:
-            score = 0.35 + (ratio - 0.04) / 0.06 * 0.35
+        elif ratio < 0.03:
+            score = 0.12 + (ratio - 0.01) / 0.02 * 0.28   # 0.12 -> 0.40
+        elif ratio < 0.07:
+            score = 0.40 + (ratio - 0.03) / 0.04 * 0.35   # 0.40 -> 0.75
         else:
-            score = 0.70 + min(0.30, (ratio - 0.10) / 0.10 * 0.30)
+            score = 0.75 + min(0.25, (ratio - 0.07) / 0.08 * 0.25)  # up to 1.0
 
         page_scores.append(float(score))
 
     if not page_scores:
         return 0.0
 
-    # Strongest page drives document score
     return float(round(min(1.0, max(page_scores)), 3))
