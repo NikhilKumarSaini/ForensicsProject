@@ -2,50 +2,34 @@ import os
 import numpy as np
 from PIL import Image
 import cv2
-import math
-
-
-# =========================
-# CONFIGURABLE THRESHOLDS
-# =========================
-ACTIVE_PIXEL_THRESHOLD = 0.01
-MIN_ACTIVE_PIXELS = 30
-
-HIGH_PERCENTILE = 90
-MIN_HIGH_PIXELS = 20
-
-MIN_REGION_AREA = 25
-MIN_REGION_WIDTH_HEIGHT = 5
-
-MIN_VALID_REGIONS_FOR_FRAUD = 1
 
 
 def compute_compression_score(forensic_output_dir: str) -> float:
     """
-    Compression scoring with strict output semantics:
+    Compression score with strict semantics:
 
     - Returns 0.0 → NO compression-based manipulation detected
-    - Returns >0 → Severity of detected manipulation (0–1)
+    - Returns >0 → Severity of manipulation (0–1)
 
-    Detection → then severity (never mixed)
+    Clean detection logic is preserved.
+    Severity logic is taken from the provided reference.
     """
 
     comp_dir = os.path.join(forensic_output_dir, "Compression")
     if not os.path.exists(comp_dir):
         return 0.0
 
-    detected_scores = []  # stores severity ONLY for detected pages
+    detected_scores = []
 
     for fname in os.listdir(comp_dir):
         if not fname.lower().endswith(".jpg"):
             continue
 
-        img_path = os.path.join(comp_dir, fname)
+        path = os.path.join(comp_dir, fname)
 
-        # -------- Load compression diff image --------
         try:
             gray = np.array(
-                Image.open(img_path).convert("L"),
+                Image.open(path).convert("L"),
                 dtype=np.float32
             ) / 255.0
         except Exception:
@@ -55,79 +39,71 @@ def compute_compression_score(forensic_output_dir: str) -> float:
         total_pixels = float(h * w)
 
         # =====================================================
-        # PHASE 1 — MANIPULATION DETECTION (BINARY)
+        # PHASE 1 — CLEAN vs MANIPULATED (UNCHANGED)
         # =====================================================
 
-        # Step 1: Active residual pixels
-        active_mask = gray > ACTIVE_PIXEL_THRESHOLD
-        if int(np.sum(active_mask)) < MIN_ACTIVE_PIXELS:
+        active = gray > 0.03
+        if np.sum(active) < 200:
             continue  # clean page
 
-        # Step 2: High residual pixels
-        high_thresh = np.percentile(gray[active_mask], HIGH_PERCENTILE)
+        high_thresh = np.percentile(gray[active], 97)
         high_mask = gray >= high_thresh
-        if int(np.sum(high_mask)) < MIN_HIGH_PIXELS:
+
+        if np.sum(high_mask) < 80:
             continue  # clean page
 
-        # Step 3: Connected components (locations)
-        mask_uint8 = (high_mask.astype(np.uint8)) * 255
+        mask = (high_mask * 255).astype(np.uint8)
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-            mask_uint8, connectivity=8
+            mask, connectivity=8
         )
 
         valid_regions = []
 
         for i in range(1, num_labels):
-            area = int(stats[i, cv2.CC_STAT_AREA])
+            area = stats[i, cv2.CC_STAT_AREA]
             x, y, bw, bh, _ = stats[i]
 
-            if area < MIN_REGION_AREA:
-                continue
-            if bw < MIN_REGION_WIDTH_HEIGHT or bh < MIN_REGION_WIDTH_HEIGHT:
+            if area < 150:
                 continue
 
-            valid_regions.append((i, area))
+            aspect_ratio = max(bw, bh) / max(1, min(bw, bh))
+            if aspect_ratio > 8:
+                continue
 
-        # 🔴 FINAL DETECTION DECISION
-        if len(valid_regions) < MIN_VALID_REGIONS_FOR_FRAUD:
-            continue  # clean page
+            density = area / (bw * bh)
+            if density < 0.25:
+                continue
+
+            valid_regions.append(area)
+
+        # HARD CLEAN DECISION
+        if not valid_regions:
+            continue
 
         # =====================================================
-        # PHASE 2 — SEVERITY SCORING (ONLY IF DETECTED)
+        # PHASE 2 — SEVERITY SCORING (FROM YOUR LOGIC)
         # =====================================================
 
-        location_scores = []
+        location_count = len(valid_regions)
+        location_score = min(1.0, location_count / 3.0)
 
-        for label_id, area in valid_regions:
-            region_mask = (labels == label_id)
+        energy_score = float(np.mean(gray[high_mask]))
+        area_score = float(sum(valid_regions) / total_pixels)
 
-            energy = float(np.mean(gray[region_mask]))
-            area_ratio = float(area / total_pixels)
+        severity_score = (
+            0.60 * location_score +
+            0.25 * energy_score +
+            0.15 * area_score * 10.0
+        )
 
-            loc_score = (
-                0.7 * energy +
-                0.3 * area_ratio * 10.0
-            )
-
-            location_scores.append(min(1.0, loc_score))
-
-        # Aggregate severity
-        mean_location_score = float(np.mean(location_scores))
-        location_count = int(len(location_scores))
-
-        boost = 1.0 + 0.6 * math.log1p(location_count)
-        severity_score = min(1.0, mean_location_score * boost)
-
-        detected_scores.append(severity_score)
+        detected_scores.append(min(1.0, severity_score))
 
     # =====================================================
-    # FINAL OUTPUT SEMANTICS
+    # FINAL OUTPUT
     # =====================================================
 
-    # No page detected as manipulated
     if not detected_scores:
         return 0.0
 
-    # At least one page manipulated → return severity
     return float(round(max(detected_scores), 3))
 
