@@ -2,19 +2,21 @@ import os
 import numpy as np
 from PIL import Image
 import cv2
+import math
 
 
 def compute_compression_score(forensic_output_dir: str) -> float:
     """
-    Compression tampering score.
+    Compression-based manipulation severity score.
 
-    Output:
-    - 0.0  → clean (no compression-based manipulation)
+    Output semantics:
+    - 0.0  → clean (no meaningful compression inconsistency)
     - >0.0 → severity of manipulation (0–1)
 
-    Key fixes:
-    - Filters benign text-line compression noise
-    - Preserves real row-based & logo manipulations
+    Design principles:
+    - Detect localized OR widespread recompression
+    - Ignore benign text-line JPEG noise
+    - Penalize multiple manipulation locations more than single
     """
 
     comp_dir = os.path.join(forensic_output_dir, "Compression")
@@ -27,12 +29,14 @@ def compute_compression_score(forensic_output_dir: str) -> float:
         if not fname.lower().endswith(".jpg"):
             continue
 
-        path = os.path.join(comp_dir, fname)
+        img_path = os.path.join(comp_dir, fname)
 
-        # ---------------- Load image ----------------
+        # ===============================
+        # LOAD IMAGE
+        # ===============================
         try:
             gray = np.array(
-                Image.open(path).convert("L"),
+                Image.open(img_path).convert("L"),
                 dtype=np.float32
             ) / 255.0
         except Exception:
@@ -41,49 +45,54 @@ def compute_compression_score(forensic_output_dir: str) -> float:
         h, w = gray.shape
         total_pixels = h * w
 
-        # =====================================================
-        # PRE-CHECK: Flat / empty compression image → CLEAN
-        # =====================================================
+        # ===============================
+        # HARD CLEAN FILTER
+        # ===============================
+        # Fully dark / flat compression image
         if np.max(gray) < 0.05:
             page_scores.append(0.0)
             continue
 
-        if np.mean(gray > 0.05) < 0.001:
+        # Almost no residual activity
+        if np.mean(gray > 0.04) < 0.001:
             page_scores.append(0.0)
             continue
 
-        # =====================================================
-        # STEP 1: Residual activation
-        # =====================================================
-        active_mask = gray > 0.02
-        if np.sum(active_mask) < 120:
+        # ===============================
+        # STEP 1 — ACTIVE RESIDUALS
+        # ===============================
+        active_mask = gray > 0.03
+        active_count = int(np.sum(active_mask))
+
+        if active_count < 150:
             page_scores.append(0.0)
             continue
 
         active_vals = gray[active_mask]
 
-        # =====================================================
-        # STEP 2: Strong residuals
-        # =====================================================
+        # ===============================
+        # STEP 2 — STRONG RESIDUALS
+        # ===============================
         high_thresh = np.percentile(active_vals, 95)
         high_mask = gray >= high_thresh
+        high_count = int(np.sum(high_mask))
 
-        if np.sum(high_mask) < 60:
+        if high_count < 80:
             page_scores.append(0.0)
             continue
 
-        # =====================================================
-        # STEP 3: Connected components
-        # =====================================================
+        # ===============================
+        # STEP 3 — CONNECTED COMPONENTS
+        # ===============================
         mask_uint8 = (high_mask * 255).astype(np.uint8)
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
             mask_uint8, connectivity=8
         )
 
-        region_info = []
+        regions = []
 
         for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
+            area = int(stats[i, cv2.CC_STAT_AREA])
             x, y, bw, bh, _ = stats[i]
 
             if area < 120:
@@ -91,61 +100,63 @@ def compute_compression_score(forensic_output_dir: str) -> float:
             if bw < 6 or bh < 6:
                 continue
 
-            region_info.append((area, x, y, bw, bh))
+            regions.append((area, x, y, bw, bh))
 
-        # =====================================================
-        # CLEAN TEXT-LINE NOISE FILTER (FIXED)
-        # =====================================================
-        if len(region_info) >= 5:
-            ys = [r[2] for r in region_info]
-            areas = [r[0] for r in region_info]
+        # ===============================
+        # TEXT-LINE NOISE vs REAL CHANGE
+        # ===============================
+        if regions:
+            ys = [r[2] for r in regions]
+            areas = [r[0] for r in regions]
 
             y_std = np.std(ys)
             area_std = np.std(areas) / (np.mean(areas) + 1e-6)
 
-            # Clean text noise:
-            # aligned AND uniform region sizes
-            if y_std < 12 and area_std < 0.35:
+            # Clean text noise ONLY if:
+            # - aligned
+            # - uniform
+            # - few regions
+            if y_std < 12 and area_std < 0.35 and len(regions) < 8:
                 page_scores.append(0.0)
                 continue
 
-        # =====================================================
-        # HARD CLEAN GATE
-        # =====================================================
-        if not region_info:
+        # ===============================
+        # IF NO REGIONS → CLEAN
+        # ===============================
+        if not regions:
             page_scores.append(0.0)
             continue
 
-        # =====================================================
-        # SEVERITY SCORING (YOUR LOGIC)
-        # =====================================================
+        # ===============================
+        # SEVERITY SCORING
+        # ===============================
 
-        # 1️⃣ Energy
+        # 1️⃣ Energy of manipulation
         energy = float(np.mean(gray[high_mask]))
 
-        # 2️⃣ Concentration / area
-        high_pixel_count = int(np.sum(high_mask))
-        concentration = high_pixel_count / total_pixels
+        # 2️⃣ Area involvement
+        concentration = high_count / total_pixels
         area_ratio = concentration
 
-        # 3️⃣ Largest patch
-        region_areas = [r[0] for r in region_info]
-        largest_patch_ratio = max(region_areas) / total_pixels
+        # 3️⃣ Largest manipulation block
+        largest_patch_ratio = max(r[0] for r in regions) / total_pixels
 
         # 4️⃣ Number of manipulation locations
-        manipulation_count = len(region_areas)
-        manipulation_score = min(1.0, manipulation_count / 4.0)
+        location_count = len(regions)
+        location_score = min(1.0, location_count / 4.0)
 
+        # ===============================
+        # FINAL SCORE (WEIGHTED)
+        # ===============================
         raw_score = (
             0.30 * energy +
             0.20 * concentration * 10.0 +
             0.15 * area_ratio * 10.0 +
             0.20 * largest_patch_ratio * 15.0 +
-            0.15 * manipulation_score
+            0.15 * location_score
         )
 
-        score = min(1.0, raw_score)
-        page_scores.append(score)
+        page_scores.append(min(1.0, raw_score))
 
     if not page_scores:
         return 0.0
