@@ -6,15 +6,15 @@ import cv2
 
 def compute_compression_score(forensic_output_dir: str) -> float:
     """
-    Compression tampering score with CLEAN vs MANIPULATED differentiation.
+    Compression tampering score.
 
-    Output semantics:
-    - 0.0  → Clean (no compression-based manipulation)
-    - >0.0 → Severity of manipulation (0–1)
+    Output:
+    - 0.0  → clean (no compression-based manipulation)
+    - >0.0 → severity of manipulation (0–1)
 
-    Fixes:
-    - Filters repetitive text-line compression noise
-    - Rewards irregular, multi-location edits
+    Key fixes:
+    - Filters benign text-line compression noise
+    - Preserves real row-based & logo manipulations
     """
 
     comp_dir = os.path.join(forensic_output_dir, "Compression")
@@ -27,12 +27,12 @@ def compute_compression_score(forensic_output_dir: str) -> float:
         if not fname.lower().endswith(".jpg"):
             continue
 
-        img_path = os.path.join(comp_dir, fname)
+        path = os.path.join(comp_dir, fname)
 
         # ---------------- Load image ----------------
         try:
             gray = np.array(
-                Image.open(img_path).convert("L"),
+                Image.open(path).convert("L"),
                 dtype=np.float32
             ) / 255.0
         except Exception:
@@ -42,7 +42,7 @@ def compute_compression_score(forensic_output_dir: str) -> float:
         total_pixels = h * w
 
         # =====================================================
-        # PRE-CHECK: Mostly dark / flat image → CLEAN
+        # PRE-CHECK: Flat / empty compression image → CLEAN
         # =====================================================
         if np.max(gray) < 0.05:
             page_scores.append(0.0)
@@ -91,18 +91,21 @@ def compute_compression_score(forensic_output_dir: str) -> float:
             if bw < 6 or bh < 6:
                 continue
 
-            aspect_ratio = bw / max(1, bh)
-            region_info.append((area, x, y, bw, bh, aspect_ratio))
+            region_info.append((area, x, y, bw, bh))
 
         # =====================================================
-        # CLEAN TEXT-LINE NOISE FILTER (KEY FIX)
+        # CLEAN TEXT-LINE NOISE FILTER (FIXED)
         # =====================================================
         if len(region_info) >= 5:
             ys = [r[2] for r in region_info]
-            y_std = np.std(ys)
+            areas = [r[0] for r in region_info]
 
-            # Very low vertical variance → horizontal text lines
-            if y_std < 12:
+            y_std = np.std(ys)
+            area_std = np.std(areas) / (np.mean(areas) + 1e-6)
+
+            # Clean text noise:
+            # aligned AND uniform region sizes
+            if y_std < 12 and area_std < 0.35:
                 page_scores.append(0.0)
                 continue
 
@@ -114,7 +117,7 @@ def compute_compression_score(forensic_output_dir: str) -> float:
             continue
 
         # =====================================================
-        # SEVERITY SCORING (YOUR LOGIC, FIXED)
+        # SEVERITY SCORING (YOUR LOGIC)
         # =====================================================
 
         # 1️⃣ Energy
@@ -125,15 +128,14 @@ def compute_compression_score(forensic_output_dir: str) -> float:
         concentration = high_pixel_count / total_pixels
         area_ratio = concentration
 
-        # 3️⃣ Largest means real edit
+        # 3️⃣ Largest patch
         region_areas = [r[0] for r in region_info]
         largest_patch_ratio = max(region_areas) / total_pixels
 
-        # 4️⃣ Number of distinct locations
+        # 4️⃣ Number of manipulation locations
         manipulation_count = len(region_areas)
         manipulation_score = min(1.0, manipulation_count / 4.0)
 
-        # 🔢 Final weighted score
         raw_score = (
             0.30 * energy +
             0.20 * concentration * 10.0 +
