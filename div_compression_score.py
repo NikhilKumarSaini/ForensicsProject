@@ -1,6 +1,7 @@
 import os
 import numpy as np
 from PIL import Image
+import cv2
 
 
 def compute_compression_score(forensic_output_dir: str) -> float:
@@ -10,13 +11,15 @@ def compute_compression_score(forensic_output_dir: str) -> float:
 
     Assumptions:
     - Input images are compression difference outputs
-    - High-energy residual regions (orange/blue clusters)
+    - High-energy residual regions (orange / blue clusters)
       indicate localized recompression
     - No watermark present in compression image
 
     Method:
-    - Focus on strongest residual responses (top percentile)
-    - Measure energy + spatial concentration
+    - Measure residual energy
+    - Measure spatial concentration
+    - Measure total highlighted area
+    - Measure largest connected highlighted patch
     """
 
     comp_dir = os.path.join(forensic_output_dir, "Compression")
@@ -37,32 +40,56 @@ def compute_compression_score(forensic_output_dir: str) -> float:
         except Exception:
             continue
 
-        # Normalize to [0, 1]
+        # Normalize to [0,1]
         gray /= 255.0
+        h, w = gray.shape
+        total_pixels = h * w
 
-        # Ignore near-zero background
-        active = gray[gray > 0.02]
-        if active.size < 100:
+        # Remove near-zero background
+        active_mask = gray > 0.02
+        if np.sum(active_mask) < 100:
             page_scores.append(0.0)
             continue
 
-        # Focus on strongest residuals (colored regions)
-        high_threshold = np.percentile(active, 95)
-        high_residuals = active[active >= high_threshold]
+        active_vals = gray[active_mask]
 
-        if high_residuals.size < 50:
+        # High-energy residual threshold (top 5%)
+        high_thresh = np.percentile(active_vals, 95)
+        high_mask = gray >= high_thresh
+
+        high_pixel_count = int(np.sum(high_mask))
+        if high_pixel_count < 50:
             page_scores.append(0.0)
             continue
 
-        # Residual energy (strength of compression artifacts)
-        energy = float(np.mean(high_residuals))
+        # 1️⃣ Residual Energy (strength)
+        energy = float(np.mean(gray[high_mask]))
 
-        # Spatial concentration (localized edits)
-        concentration = float(high_residuals.size) / float(gray.size)
+        # 2️⃣ Spatial Concentration
+        concentration = high_pixel_count / total_pixels
 
-        # Combined compression signal
-        # Scaling factor chosen empirically for JPEG residuals
-        raw_score = energy * concentration * 8.0
+        # 3️⃣ Area Ratio (explicit)
+        area_ratio = concentration
+
+        # 4️⃣ Largest Connected Patch Ratio
+        mask_uint8 = (high_mask * 255).astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask_uint8, connectivity=8
+        )
+
+        if num_labels > 1:
+            largest_patch_area = max(stats[1:, cv2.CC_STAT_AREA])
+            largest_patch_ratio = largest_patch_area / total_pixels
+        else:
+            largest_patch_ratio = 0.0
+
+        # 🔢 Final Compression Score (weighted, stable)
+        raw_score = (
+            0.35 * energy +
+            0.25 * concentration * 10.0 +
+            0.20 * area_ratio * 10.0 +
+            0.20 * largest_patch_ratio * 15.0
+        )
 
         score = min(1.0, raw_score)
         page_scores.append(score)
@@ -70,5 +97,6 @@ def compute_compression_score(forensic_output_dir: str) -> float:
     if not page_scores:
         return 0.0
 
-    # Use max-page strategy (tampering is localized)
+    # Max-page strategy (tampering is localized)
     return float(round(max(page_scores), 3))
+
