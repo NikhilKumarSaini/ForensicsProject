@@ -3,36 +3,20 @@ import numpy as np
 from PIL import Image
 
 
-def _block_variances(gray: np.ndarray, block: int = 32) -> np.ndarray:
-    """
-    Compute local variance for fixed-size blocks.
-    Variance captures compression residual energy.
-    """
-    h, w = gray.shape
-    variances = []
-
-    for y in range(0, h - block + 1, block):
-        for x in range(0, w - block + 1, block):
-            patch = gray[y:y + block, x:x + block]
-            if patch.shape != (block, block):
-                continue
-            variances.append(float(np.var(patch)))
-
-    return np.array(variances, dtype=np.float32)
-
-
 def compute_compression_score(forensic_output_dir: str) -> float:
     """
-    Robust compression tampering score (0.0 – 1.0)
+    Computes compression tampering score (0.0 – 1.0) from
+    compression difference images.
 
     Assumptions:
-    - Compression difference image contains no watermark
-    - Local recompression causes variance spikes
-    - Genuine documents show uniform variance distribution
+    - Input images are compression difference outputs
+    - High-energy residual regions (orange/blue clusters)
+      indicate localized recompression
+    - No watermark present in compression image
 
     Method:
-    - Block-wise variance analysis
-    - Variance inconsistency normalization
+    - Focus on strongest residual responses (top percentile)
+    - Measure energy + spatial concentration
     """
 
     comp_dir = os.path.join(forensic_output_dir, "Compression")
@@ -45,36 +29,46 @@ def compute_compression_score(forensic_output_dir: str) -> float:
         if not fname.lower().endswith(".jpg"):
             continue
 
-        path = os.path.join(comp_dir, fname)
+        img_path = os.path.join(comp_dir, fname)
+
         try:
-            with Image.open(path).convert("L") as im:
+            with Image.open(img_path).convert("L") as im:
                 gray = np.array(im, dtype=np.float32)
         except Exception:
             continue
 
-        # 1️⃣ Local variance extraction
-        variances = _block_variances(gray, block=32)
-        if variances.size < 50:
+        # Normalize to [0, 1]
+        gray /= 255.0
+
+        # Ignore near-zero background
+        active = gray[gray > 0.02]
+        if active.size < 100:
             page_scores.append(0.0)
             continue
 
-        # 2️⃣ Robust statistics (median-based, outlier-safe)
-        med = float(np.median(variances))
-        mad = float(np.median(np.abs(variances - med))) + 1e-6
+        # Focus on strongest residuals (colored regions)
+        high_threshold = np.percentile(active, 95)
+        high_residuals = active[active >= high_threshold]
 
-        # 3️⃣ Normalized inconsistency score
-        # High when few blocks have much larger variance
-        inconsistency = float(np.mean((variances - med) ** 2) ** 0.5 / mad)
+        if high_residuals.size < 50:
+            page_scores.append(0.0)
+            continue
 
-        # 4️⃣ Normalize to [0,1]
-        # Empirically stable for JPEG residuals
-        Tc = 6.0
-        score = min(1.0, inconsistency / Tc)
+        # Residual energy (strength of compression artifacts)
+        energy = float(np.mean(high_residuals))
 
+        # Spatial concentration (localized edits)
+        concentration = float(high_residuals.size) / float(gray.size)
+
+        # Combined compression signal
+        # Scaling factor chosen empirically for JPEG residuals
+        raw_score = energy * concentration * 8.0
+
+        score = min(1.0, raw_score)
         page_scores.append(score)
 
     if not page_scores:
         return 0.0
 
-    # Max-page strategy (bank fraud is localized)
-    return float(round(min(1.0, max(page_scores)), 3))
+    # Use max-page strategy (tampering is localized)
+    return float(round(max(page_scores), 3))
