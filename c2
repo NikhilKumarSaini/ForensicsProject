@@ -1,22 +1,22 @@
 import os
 import numpy as np
 from PIL import Image
-import cv2
-import math
 
 
 def compute_compression_score(forensic_output_dir: str) -> float:
     """
-    Compression-based manipulation severity score.
+    Computes compression tampering score (0.0 – 1.0) from
+    compression difference images.
 
-    Output semantics:
-    - 0.0  → clean (no meaningful compression inconsistency)
-    - >0.0 → severity of manipulation (0–1)
+    Assumptions:
+    - Input images are compression difference outputs
+    - High-energy residual regions (orange/blue clusters)
+      indicate localized recompression
+    - No watermark present in compression image
 
-    Design principles:
-    - Detect localized OR widespread recompression
-    - Ignore benign text-line JPEG noise
-    - Penalize multiple manipulation locations more than single
+    Method:
+    - Focus on strongest residual responses (top percentile)
+    - Measure energy + spatial concentration
     """
 
     comp_dir = os.path.join(forensic_output_dir, "Compression")
@@ -31,134 +31,44 @@ def compute_compression_score(forensic_output_dir: str) -> float:
 
         img_path = os.path.join(comp_dir, fname)
 
-        # ===============================
-        # LOAD IMAGE
-        # ===============================
         try:
-            gray = np.array(
-                Image.open(img_path).convert("L"),
-                dtype=np.float32
-            ) / 255.0
+            with Image.open(img_path).convert("L") as im:
+                gray = np.array(im, dtype=np.float32)
         except Exception:
             continue
 
-        h, w = gray.shape
-        total_pixels = h * w
+        # Normalize to [0, 1]
+        gray /= 255.0
 
-        # ===============================
-        # HARD CLEAN FILTER
-        # ===============================
-        # Fully dark / flat compression image
-        if np.max(gray) < 0.05:
+        # Ignore near-zero background
+        active = gray[gray > 0.02]
+        if active.size < 100:
             page_scores.append(0.0)
             continue
 
-        # Almost no residual activity
-        if np.mean(gray > 0.04) < 0.001:
+        # Focus on strongest residuals (colored regions)
+        high_threshold = np.percentile(active, 95)
+        high_residuals = active[active >= high_threshold]
+
+        if high_residuals.size < 50:
             page_scores.append(0.0)
             continue
 
-        # ===============================
-        # STEP 1 — ACTIVE RESIDUALS
-        # ===============================
-        active_mask = gray > 0.03
-        active_count = int(np.sum(active_mask))
+        # Residual energy (strength of compression artifacts)
+        energy = float(np.mean(high_residuals))
 
-        if active_count < 150:
-            page_scores.append(0.0)
-            continue
+        # Spatial concentration (localized edits)
+        concentration = float(high_residuals.size) / float(gray.size)
 
-        active_vals = gray[active_mask]
+        # Combined compression signal
+        # Scaling factor chosen empirically for JPEG residuals
+        raw_score = energy * concentration * 8.0
 
-        # ===============================
-        # STEP 2 — STRONG RESIDUALS
-        # ===============================
-        high_thresh = np.percentile(active_vals, 95)
-        high_mask = gray >= high_thresh
-        high_count = int(np.sum(high_mask))
-
-        if high_count < 80:
-            page_scores.append(0.0)
-            continue
-
-        # ===============================
-        # STEP 3 — CONNECTED COMPONENTS
-        # ===============================
-        mask_uint8 = (high_mask * 255).astype(np.uint8)
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-            mask_uint8, connectivity=8
-        )
-
-        regions = []
-
-        for i in range(1, num_labels):
-            area = int(stats[i, cv2.CC_STAT_AREA])
-            x, y, bw, bh, _ = stats[i]
-
-            if area < 120:
-                continue
-            if bw < 6 or bh < 6:
-                continue
-
-            regions.append((area, x, y, bw, bh))
-
-        # ===============================
-        # TEXT-LINE NOISE vs REAL CHANGE
-        # ===============================
-        if regions:
-            ys = [r[2] for r in regions]
-            areas = [r[0] for r in regions]
-
-            y_std = np.std(ys)
-            area_std = np.std(areas) / (np.mean(areas) + 1e-6)
-
-            # Clean text noise ONLY if:
-            # - aligned
-            # - uniform
-            # - few regions
-            if y_std < 12 and area_std < 0.35 and len(regions) < 8:
-                page_scores.append(0.0)
-                continue
-
-        # ===============================
-        # IF NO REGIONS → CLEAN
-        # ===============================
-        if not regions:
-            page_scores.append(0.0)
-            continue
-
-        # ===============================
-        # SEVERITY SCORING
-        # ===============================
-
-        # 1️⃣ Energy of manipulation
-        energy = float(np.mean(gray[high_mask]))
-
-        # 2️⃣ Area involvement
-        concentration = high_count / total_pixels
-        area_ratio = concentration
-
-        # 3️⃣ Largest manipulation block
-        largest_patch_ratio = max(r[0] for r in regions) / total_pixels
-
-        # 4️⃣ Number of manipulation locations
-        location_count = len(regions)
-        location_score = min(1.0, location_count / 4.0)
-
-        # ===============================
-        # FINAL SCORE (WEIGHTED)
-        # ===============================
-        raw_score = (
-            0.30 * energy +
-            0.20 * concentration * 10.0 +
-            0.15 * area_ratio * 10.0 +
-            0.20 * largest_patch_ratio * 15.0 +
-            0.15 * location_score
-        )
-
-        page_scores.append(min(1.0, raw_score))
+        score = min(1.0, raw_score)
+        page_scores.append(score)
 
     if not page_scores:
         return 0.0
 
+    # Use max-page strategy (tampering is localized)
     return float(round(max(page_scores), 3))
