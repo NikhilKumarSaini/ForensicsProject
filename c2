@@ -22,19 +22,19 @@ MIN_VALID_REGIONS_FOR_FRAUD = 1
 
 def compute_compression_score(forensic_output_dir: str) -> float:
     """
-    Two-stage compression scoring:
-    1. Detect if manipulation exists
-    2. If yes, score severity
+    Compression scoring with strict output semantics:
 
-    Returns:
-        compression_score (float): 0.0 – 1.0
+    - Returns 0.0 → NO compression-based manipulation detected
+    - Returns >0 → Severity of detected manipulation (0–1)
+
+    Detection → then severity (never mixed)
     """
 
     comp_dir = os.path.join(forensic_output_dir, "Compression")
     if not os.path.exists(comp_dir):
         return 0.0
 
-    page_scores = []
+    detected_scores = []  # stores severity ONLY for detected pages
 
     for fname in os.listdir(comp_dir):
         if not fname.lower().endswith(".jpg"):
@@ -55,22 +55,18 @@ def compute_compression_score(forensic_output_dir: str) -> float:
         total_pixels = float(h * w)
 
         # =====================================================
-        # PHASE 1 — MANIPULATION DETECTION (HARD GATE)
+        # PHASE 1 — MANIPULATION DETECTION (BINARY)
         # =====================================================
 
         # Step 1: Active residual pixels
         active_mask = gray > ACTIVE_PIXEL_THRESHOLD
-        active_count = int(np.sum(active_mask))
-
-        if active_count < MIN_ACTIVE_PIXELS:
+        if int(np.sum(active_mask)) < MIN_ACTIVE_PIXELS:
             continue  # clean page
 
         # Step 2: High residual pixels
         high_thresh = np.percentile(gray[active_mask], HIGH_PERCENTILE)
         high_mask = gray >= high_thresh
-        high_count = int(np.sum(high_mask))
-
-        if high_count < MIN_HIGH_PIXELS:
+        if int(np.sum(high_mask)) < MIN_HIGH_PIXELS:
             continue  # clean page
 
         # Step 3: Connected components (locations)
@@ -92,12 +88,12 @@ def compute_compression_score(forensic_output_dir: str) -> float:
 
             valid_regions.append((i, area))
 
-        # HARD DECISION: clean or manipulated
+        # 🔴 FINAL DETECTION DECISION
         if len(valid_regions) < MIN_VALID_REGIONS_FOR_FRAUD:
             continue  # clean page
 
         # =====================================================
-        # PHASE 2 — SEVERITY SCORING (ONLY IF MANIPULATED)
+        # PHASE 2 — SEVERITY SCORING (ONLY IF DETECTED)
         # =====================================================
 
         location_scores = []
@@ -108,7 +104,6 @@ def compute_compression_score(forensic_output_dir: str) -> float:
             energy = float(np.mean(gray[region_mask]))
             area_ratio = float(area / total_pixels)
 
-            # Per-location severity
             loc_score = (
                 0.7 * energy +
                 0.3 * area_ratio * 10.0
@@ -120,14 +115,19 @@ def compute_compression_score(forensic_output_dir: str) -> float:
         mean_location_score = float(np.mean(location_scores))
         location_count = int(len(location_scores))
 
-        # Non-linear boost for multiple locations
         boost = 1.0 + 0.6 * math.log1p(location_count)
+        severity_score = min(1.0, mean_location_score * boost)
 
-        final_page_score = min(1.0, mean_location_score * boost)
-        page_scores.append(final_page_score)
+        detected_scores.append(severity_score)
 
-    if not page_scores:
+    # =====================================================
+    # FINAL OUTPUT SEMANTICS
+    # =====================================================
+
+    # No page detected as manipulated
+    if not detected_scores:
         return 0.0
 
-    # Use max-page strategy
-    return float(round(max(page_scores), 3))
+    # At least one page manipulated → return severity
+    return float(round(max(detected_scores), 3))
+
