@@ -2,17 +2,29 @@ import os
 import numpy as np
 from PIL import Image
 import cv2
+import math
+
+
+# =========================
+# CONFIGURABLE THRESHOLDS
+# =========================
+ACTIVE_PIXEL_THRESHOLD = 0.008
+MIN_ACTIVE_PIXELS = 15
+
+HIGH_PERCENTILE = 85
+MIN_HIGH_PIXELS = 10
+
+MIN_REGION_AREA = 20
+MIN_REGION_WIDTH_HEIGHT = 4
+
+MIN_VALID_REGIONS_FOR_FRAUD = 1
 
 
 def compute_compression_score(forensic_output_dir: str) -> float:
     """
-    Compression score with strict semantics:
-
-    - Returns 0.0 → NO compression-based manipulation detected
-    - Returns >0 → Severity of manipulation (0–1)
-
-    Clean detection logic is preserved.
-    Severity logic is taken from the provided reference.
+    Output semantics:
+    - 0.0  → No compression-based manipulation detected
+    - >0.0 → Severity of manipulation (0–1)
     """
 
     comp_dir = os.path.join(forensic_output_dir, "Compression")
@@ -25,11 +37,11 @@ def compute_compression_score(forensic_output_dir: str) -> float:
         if not fname.lower().endswith(".jpg"):
             continue
 
-        path = os.path.join(comp_dir, fname)
+        img_path = os.path.join(comp_dir, fname)
 
         try:
             gray = np.array(
-                Image.open(path).convert("L"),
+                Image.open(img_path).convert("L"),
                 dtype=np.float32
             ) / 255.0
         except Exception:
@@ -38,57 +50,51 @@ def compute_compression_score(forensic_output_dir: str) -> float:
         h, w = gray.shape
         total_pixels = float(h * w)
 
-        # =====================================================
-        # PHASE 1 — CLEAN vs MANIPULATED (UNCHANGED)
-        # =====================================================
+        # ================================
+        # PHASE 1 — MANIPULATION DETECTION
+        # ================================
 
-        active = gray > 0.03
-        if np.sum(active) < 200:
-            continue  # clean page
+        active_mask = gray > ACTIVE_PIXEL_THRESHOLD
+        if int(np.sum(active_mask)) < MIN_ACTIVE_PIXELS:
+            continue
 
-        high_thresh = np.percentile(gray[active], 97)
+        high_thresh = np.percentile(gray[active_mask], HIGH_PERCENTILE)
         high_mask = gray >= high_thresh
+        if int(np.sum(high_mask)) < MIN_HIGH_PIXELS:
+            continue
 
-        if np.sum(high_mask) < 80:
-            continue  # clean page
-
-        mask = (high_mask * 255).astype(np.uint8)
+        mask_uint8 = (high_mask.astype(np.uint8)) * 255
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-            mask, connectivity=8
+            mask_uint8, connectivity=8
         )
 
         valid_regions = []
 
         for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
+            area = int(stats[i, cv2.CC_STAT_AREA])
             x, y, bw, bh, _ = stats[i]
 
-            if area < 150:
+            if area < MIN_REGION_AREA:
+                continue
+            if bw < MIN_REGION_WIDTH_HEIGHT or bh < MIN_REGION_WIDTH_HEIGHT:
                 continue
 
-            aspect_ratio = max(bw, bh) / max(1, min(bw, bh))
-            if aspect_ratio > 8:
-                continue
-
-            density = area / (bw * bh)
-            if density < 0.25:
-                continue
-
-            valid_regions.append(area)
+            valid_regions.append((i, area))
 
         # HARD CLEAN DECISION
-        if not valid_regions:
+        if len(valid_regions) < MIN_VALID_REGIONS_FOR_FRAUD:
             continue
 
-        # =====================================================
-        # PHASE 2 — SEVERITY SCORING (FROM YOUR LOGIC)
-        # =====================================================
+        # ================================
+        # PHASE 2 — SEVERITY SCORING
+        # (YOUR LOGIC)
+        # ================================
 
         location_count = len(valid_regions)
         location_score = min(1.0, location_count / 3.0)
 
         energy_score = float(np.mean(gray[high_mask]))
-        area_score = float(sum(valid_regions) / total_pixels)
+        area_score = float(sum(a for _, a in valid_regions) / total_pixels)
 
         severity_score = (
             0.60 * location_score +
@@ -98,12 +104,7 @@ def compute_compression_score(forensic_output_dir: str) -> float:
 
         detected_scores.append(min(1.0, severity_score))
 
-    # =====================================================
-    # FINAL OUTPUT
-    # =====================================================
-
     if not detected_scores:
         return 0.0
 
     return float(round(max(detected_scores), 3))
-
